@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS users (
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_yape VARCHAR(20);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_data BYTEA;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_mime VARCHAR(50);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS muted_until TIMESTAMPTZ;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason VARCHAR(250);
@@ -95,7 +97,10 @@ function publicUser(row, includePrivate = false) {
     name: row.name,
     username: row.username,
     role: row.role,
-    avatarUrl: row.avatar_url || null,
+    avatarUrl:
+      row.avatar_data
+        ? `/api/users/${row.id}/avatar`
+        : (row.avatar_url || null),
     status: row.status || 'active'
   };
 
@@ -188,7 +193,7 @@ app.get('/health', (_, res) =>
   res.json({
     ok: true,
     service: 'Ludo Activo',
-    version: '0.5.0'
+    version: '0.5.4'
   })
 );
 
@@ -496,17 +501,13 @@ app.patch('/api/profile', activeAuth, async (req, res) => {
 
 app.post('/api/profile/avatar', activeAuth, async (req, res) => {
   try {
-    if (!CLOUDFLARE_ACCOUNT_ID || !CLOUDFLARE_API_TOKEN) {
-      return res.status(500).json({
-        error: 'Cloudflare Images no está configurado'
-      });
-    }
+    const imageBase64 =
+      String(req.body.imageBase64 || '');
 
-    const imageBase64 = String(req.body.imageBase64 || '');
-
-    const match = imageBase64.match(
-      /^data:(image\/(?:jpeg|jpg|png|webp));base64,(.+)$/i
-    );
+    const match =
+      imageBase64.match(
+        /^data:(image\/(?:jpeg|jpg|png|webp));base64,(.+)$/i
+      );
 
     if (!match) {
       return res.status(400).json({
@@ -519,80 +520,41 @@ app.post('/api/profile/avatar', activeAuth, async (req, res) => {
         ? 'image/jpeg'
         : match[1];
 
-    const bytes = Buffer.from(match[2], 'base64');
+    const bytes =
+      Buffer.from(match[2], 'base64');
 
-    if (!bytes.length || bytes.length > 5 * 1024 * 1024) {
+    if (
+      !bytes.length ||
+      bytes.length > 3 * 1024 * 1024
+    ) {
       return res.status(400).json({
-        error: 'La imagen debe pesar menos de 5 MB'
+        error: 'La foto debe pesar menos de 3 MB'
       });
     }
 
-    const form = new FormData();
-
-    form.append(
-      'file',
-      new Blob([bytes], { type: mime }),
-      `avatar-${req.currentUser.id}-${Date.now()}.jpg`
-    );
-
-    form.append(
-      'metadata',
-      JSON.stringify({
-        userId: req.currentUser.id,
-        username: req.currentUser.username,
-        kind: 'avatar'
-      })
-    );
-
-    const cfResponse = await fetch(
-      `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/images/v1`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`
-        },
-        body: form
-      }
-    );
-
-    const data = await cfResponse.json();
-
-    if (!cfResponse.ok || data?.success === false) {
-      console.error(
-        'Cloudflare Images error:',
-        JSON.stringify(data)
+    const q =
+      await pool.query(
+        `UPDATE users
+         SET avatar_data=$1,
+             avatar_mime=$2,
+             avatar_url=NULL
+         WHERE id=$3
+         RETURNING *`,
+        [
+          bytes,
+          mime,
+          req.currentUser.id
+        ]
       );
-
-      return res.status(502).json({
-        error: 'No se pudo subir la foto de perfil'
-      });
-    }
-
-    const avatarUrl =
-      Array.isArray(data?.result?.variants) &&
-      data.result.variants.length
-        ? data.result.variants[0]
-        : null;
-
-    if (!avatarUrl) {
-      return res.status(502).json({
-        error: 'Cloudflare no devolvió una URL de imagen'
-      });
-    }
-
-    const q = await pool.query(
-      `UPDATE users
-       SET avatar_url=$1
-       WHERE id=$2
-       RETURNING *`,
-      [avatarUrl, req.currentUser.id]
-    );
 
     return res.json({
       user: publicUser(q.rows[0], true)
     });
   } catch (e) {
-    console.error('avatar upload error', e);
+    console.error(
+      'avatar upload error',
+      e
+    );
 
     return res.status(500).json({
       error: 'No se pudo actualizar la foto de perfil'
@@ -600,24 +562,96 @@ app.post('/api/profile/avatar', activeAuth, async (req, res) => {
   }
 });
 
+app.get('/api/users/:id/avatar', async (req, res) => {
+  try {
+    const q =
+      await pool.query(
+        `SELECT avatar_data,avatar_mime
+         FROM users
+         WHERE id=$1
+         LIMIT 1`,
+        [Number(req.params.id)]
+      );
+
+    if (
+      !q.rowCount ||
+      !q.rows[0].avatar_data
+    ) {
+      return res.status(404).end();
+    }
+
+    res.setHeader(
+      'Content-Type',
+      q.rows[0].avatar_mime ||
+        'image/jpeg'
+    );
+
+    res.setHeader(
+      'Cache-Control',
+      'public, max-age=300'
+    );
+
+    return res.send(
+      q.rows[0].avatar_data
+    );
+  } catch (e) {
+    console.error(
+      'avatar read error',
+      e
+    );
+
+    return res.status(500).end();
+  }
+});
+
 app.get('/api/chat/history', activeAuth, async (_req, res) => {
   const q = await pool.query(
-    `SELECT cm.id,cm.user_id,cm.username,cm.message,cm.created_at,u.avatar_url
+    `SELECT cm.id,cm.user_id,cm.username,cm.message,cm.created_at,u.avatar_url,(u.avatar_data IS NOT NULL) AS has_avatar
      FROM chat_messages cm
      JOIN users u ON u.id=cm.user_id
      WHERE cm.deleted_at IS NULL
      ORDER BY cm.id DESC LIMIT 100`
   );
-  res.json({ messages: q.rows.reverse() });
+  const messages =
+    q.rows.reverse().map(row => ({
+      id: row.id,
+      user_id: row.user_id,
+      username: row.username,
+      message: row.message,
+      created_at: row.created_at,
+      avatar_url:
+        row.has_avatar
+          ? `/api/users/${row.user_id}/avatar`
+          : (row.avatar_url || null)
+    }));
+
+  res.json({ messages });
 });
 
 // Lista de usuarios para panel de moderación.
 app.get('/api/mod/users', activeAuth, moderatorOnly, async (_req, res) => {
   const q = await pool.query(
-    `SELECT id,name,username,role,avatar_url,status,muted_until,created_at
+    `SELECT id,name,username,role,avatar_url,status,muted_until,created_at,
+            (avatar_data IS NOT NULL) AS has_avatar
      FROM users ORDER BY id DESC LIMIT 500`
   );
-  res.json({ users: q.rows });
+
+  const users =
+    q.rows.map(row => ({
+      id: row.id,
+      name: row.name,
+      username: row.username,
+      role: row.role,
+      avatar_url:
+        row.has_avatar
+          ? `/api/users/${row.id}/avatar`
+          : (row.avatar_url || null),
+      status: row.status,
+      muted_until: row.muted_until,
+      created_at: row.created_at
+    }));
+
+  res.json({ users });
 });
 
 app.post('/api/mod/users/:id/mute', activeAuth, moderatorOnly, async (req, res) => {
@@ -783,7 +817,10 @@ wss.on('connection', (ws, request, user) => {
       const payload = {
         type: 'message',
         ...q.rows[0],
-        avatar_url: dbUser.avatar_url || null
+        avatar_url:
+          dbUser.avatar_data
+            ? `/api/users/${dbUser.id}/avatar`
+            : (dbUser.avatar_url || null)
       };
 
       broadcast(payload);
