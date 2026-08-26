@@ -100,7 +100,7 @@ app.get('/health', (_, res) =>
   res.json({
     ok: true,
     service: 'Ludo Activo',
-    version: '0.3.0'
+    version: '0.3.1'
   })
 );
 
@@ -128,24 +128,28 @@ app.get('/health', (_, res) =>
         "hls": null
       }
 */
-app.get('/api/live/current', async (_req, res) => {
+app.get('/api/live/debug', async (_req, res) => {
   try {
-    if (!CLOUDFLARE_API_TOKEN || !CLOUDFLARE_LIVE_INPUT_ID) {
+    if (
+      !CLOUDFLARE_ACCOUNT_ID ||
+      !CLOUDFLARE_API_TOKEN ||
+      !CLOUDFLARE_LIVE_INPUT_ID
+    ) {
       return res.status(500).json({
-        live: false,
-        videoUID: null,
-        hls: null,
-        error: 'Faltan variables de Cloudflare en Railway'
+        ok: false,
+        error: 'Faltan variables de Cloudflare en Railway',
+        hasAccountId: Boolean(CLOUDFLARE_ACCOUNT_ID),
+        hasApiToken: Boolean(CLOUDFLARE_API_TOKEN),
+        hasLiveInputId: Boolean(CLOUDFLARE_LIVE_INPUT_ID)
       });
     }
 
-    const customerHost =
-      'customer-wjqmkt5ikziq5i6i.cloudflarestream.com';
+    const url =
+      `https://api.cloudflare.com/client/v4/accounts/` +
+      `${CLOUDFLARE_ACCOUNT_ID}/stream/live_inputs/` +
+      `${CLOUDFLARE_LIVE_INPUT_ID}/videos`;
 
-    const lifecycleUrl =
-      `https://${customerHost}/${CLOUDFLARE_LIVE_INPUT_ID}/lifecycle`;
-
-    const cfResponse = await fetch(lifecycleUrl, {
+    const cfResponse = await fetch(url, {
       method: 'GET',
       headers: {
         Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
@@ -155,22 +159,97 @@ app.get('/api/live/current', async (_req, res) => {
 
     const data = await cfResponse.json();
 
-    if (!cfResponse.ok) {
-      console.error('Cloudflare lifecycle error:', JSON.stringify(data));
+    const videos = Array.isArray(data?.result)
+      ? data.result
+      : [];
+
+    const samples = videos.slice(0, 5).map(video => ({
+      uid: video?.uid || null,
+      state: video?.status?.state || null,
+      readyToStream: video?.readyToStream ?? null,
+      liveInput: video?.liveInput || null,
+      hls: video?.playback?.hls || null
+    }));
+
+    return res.status(cfResponse.ok ? 200 : 502).json({
+      ok: cfResponse.ok,
+      cloudflareStatus: cfResponse.status,
+      success: data?.success ?? null,
+      resultCount: videos.length,
+      errors: data?.errors || [],
+      messages: data?.messages || [],
+      samples
+    });
+  } catch (e) {
+    console.error('live debug error', e);
+
+    return res.status(500).json({
+      ok: false,
+      error: String(e?.message || e)
+    });
+  }
+});
+
+app.get('/api/live/current', async (_req, res) => {
+  try {
+    if (
+      !CLOUDFLARE_ACCOUNT_ID ||
+      !CLOUDFLARE_API_TOKEN ||
+      !CLOUDFLARE_LIVE_INPUT_ID
+    ) {
+      return res.status(500).json({
+        live: false,
+        videoUID: null,
+        hls: null,
+        error: 'Faltan variables de Cloudflare en Railway'
+      });
+    }
+
+    const url =
+      `https://api.cloudflare.com/client/v4/accounts/` +
+      `${CLOUDFLARE_ACCOUNT_ID}/stream/live_inputs/` +
+      `${CLOUDFLARE_LIVE_INPUT_ID}/videos`;
+
+    const cfResponse = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
+        Accept: 'application/json'
+      }
+    });
+
+    const data = await cfResponse.json();
+
+    if (!cfResponse.ok || data?.success === false) {
+      console.error(
+        'Cloudflare API error:',
+        JSON.stringify(data)
+      );
 
       return res.status(502).json({
         live: false,
         videoUID: null,
         hls: null,
-        error: 'Cloudflare lifecycle no respondió correctamente',
-        status: cfResponse.status
+        error: 'Cloudflare no respondió correctamente'
       });
     }
 
-    const live = data.live === true;
-    const videoUID = data.videoUID || null;
+    const videos = Array.isArray(data?.result)
+      ? data.result
+      : [];
 
-    if (!live || !videoUID) {
+    const activeVideo =
+      videos.find(video =>
+        String(video?.status?.state || '').toLowerCase() === 'live-inprogress'
+      ) ||
+      (
+        videos.length > 0 &&
+        String(videos[0]?.status?.state || '').toLowerCase().includes('live')
+          ? videos[0]
+          : null
+      );
+
+    if (!activeVideo) {
       return res.json({
         live: false,
         videoUID: null,
@@ -178,16 +257,27 @@ app.get('/api/live/current', async (_req, res) => {
       });
     }
 
+    const videoUID =
+      activeVideo?.uid || null;
+
     const hls =
-      `https://${customerHost}/${videoUID}/manifest/video.m3u8`;
+      activeVideo?.playback?.hls ||
+      (
+        videoUID
+          ? `https://customer-wjqmkt5ikziq5i6i.cloudflarestream.com/${videoUID}/manifest/video.m3u8`
+          : null
+      );
 
     return res.json({
-      live: true,
+      live: Boolean(videoUID && hls),
       videoUID,
       hls
     });
   } catch (e) {
-    console.error('Error consultando lifecycle:', e);
+    console.error(
+      'Error consultando live actual:',
+      e
+    );
 
     return res.status(500).json({
       live: false,
