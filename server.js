@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS blocked_words (
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '8mb' }));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
@@ -188,7 +188,7 @@ app.get('/health', (_, res) =>
   res.json({
     ok: true,
     service: 'Ludo Activo',
-    version: '0.4.0'
+    version: '0.5.0'
   })
 );
 
@@ -490,6 +490,113 @@ app.patch('/api/profile', activeAuth, async (req, res) => {
     }
     console.error(e);
     res.status(500).json({ error: 'Error del servidor' });
+  }
+});
+
+
+app.post('/api/profile/avatar', activeAuth, async (req, res) => {
+  try {
+    if (!CLOUDFLARE_ACCOUNT_ID || !CLOUDFLARE_API_TOKEN) {
+      return res.status(500).json({
+        error: 'Cloudflare Images no está configurado'
+      });
+    }
+
+    const imageBase64 = String(req.body.imageBase64 || '');
+
+    const match = imageBase64.match(
+      /^data:(image\/(?:jpeg|jpg|png|webp));base64,(.+)$/i
+    );
+
+    if (!match) {
+      return res.status(400).json({
+        error: 'Formato de imagen inválido'
+      });
+    }
+
+    const mime =
+      match[1].toLowerCase() === 'image/jpg'
+        ? 'image/jpeg'
+        : match[1];
+
+    const bytes = Buffer.from(match[2], 'base64');
+
+    if (!bytes.length || bytes.length > 5 * 1024 * 1024) {
+      return res.status(400).json({
+        error: 'La imagen debe pesar menos de 5 MB'
+      });
+    }
+
+    const form = new FormData();
+
+    form.append(
+      'file',
+      new Blob([bytes], { type: mime }),
+      `avatar-${req.currentUser.id}-${Date.now()}.jpg`
+    );
+
+    form.append(
+      'metadata',
+      JSON.stringify({
+        userId: req.currentUser.id,
+        username: req.currentUser.username,
+        kind: 'avatar'
+      })
+    );
+
+    const cfResponse = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/images/v1`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`
+        },
+        body: form
+      }
+    );
+
+    const data = await cfResponse.json();
+
+    if (!cfResponse.ok || data?.success === false) {
+      console.error(
+        'Cloudflare Images error:',
+        JSON.stringify(data)
+      );
+
+      return res.status(502).json({
+        error: 'No se pudo subir la foto de perfil'
+      });
+    }
+
+    const avatarUrl =
+      Array.isArray(data?.result?.variants) &&
+      data.result.variants.length
+        ? data.result.variants[0]
+        : null;
+
+    if (!avatarUrl) {
+      return res.status(502).json({
+        error: 'Cloudflare no devolvió una URL de imagen'
+      });
+    }
+
+    const q = await pool.query(
+      `UPDATE users
+       SET avatar_url=$1
+       WHERE id=$2
+       RETURNING *`,
+      [avatarUrl, req.currentUser.id]
+    );
+
+    return res.json({
+      user: publicUser(q.rows[0], true)
+    });
+  } catch (e) {
+    console.error('avatar upload error', e);
+
+    return res.status(500).json({
+      error: 'No se pudo actualizar la foto de perfil'
+    });
   }
 });
 
