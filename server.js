@@ -100,7 +100,7 @@ app.get('/health', (_, res) =>
   res.json({
     ok: true,
     service: 'Ludo Activo',
-    version: '0.3.2'
+    version: '0.3.3'
   })
 );
 
@@ -238,22 +238,14 @@ app.get('/api/live/current', async (_req, res) => {
       ? data.result
       : [];
 
-    // Cloudflare puede devolver el video del Live Input como
-    // "live-inprogress" mientras transmite o "ready" cuando ya
-    // existe un HLS reproducible. Aceptamos ambos siempre que
-    // readyToStream no sea false y exista UID/HLS.
+    // SOLO reproducimos el broadcast realmente activo.
+    // "ready" significa una grabación terminada, no el live actual.
     const activeVideo =
       videos.find(video => {
-        const state = String(video?.status?.state || '').toLowerCase();
-        const playable = Boolean(video?.uid) &&
-          Boolean(
-            video?.playback?.hls ||
-            video?.readyToStream === true
-          );
+        const state =
+          String(video?.status?.state || '').toLowerCase();
 
-        return playable &&
-          video?.readyToStream !== false &&
-          (state === 'live-inprogress' || state === 'ready');
+        return state === 'live-inprogress';
       }) || null;
 
     if (!activeVideo) {
