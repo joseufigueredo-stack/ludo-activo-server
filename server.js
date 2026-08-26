@@ -31,6 +31,7 @@ const pool = new Pool({
       : false
 });
 
+// Migración compatible con tu tabla existente.
 await pool.query(`
 CREATE TABLE IF NOT EXISTS users (
   id SERIAL PRIMARY KEY,
@@ -42,6 +43,16 @@ CREATE TABLE IF NOT EXISTS users (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_yape VARCHAR(20);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS muted_until TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason VARCHAR(250);
+
+CREATE UNIQUE INDEX IF NOT EXISTS users_phone_yape_unique
+ON users(phone_yape)
+WHERE phone_yape IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS chat_messages (
   id BIGSERIAL PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -49,12 +60,20 @@ CREATE TABLE IF NOT EXISTS chat_messages (
   message VARCHAR(500) NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS deleted_by INTEGER;
+
+CREATE TABLE IF NOT EXISTS blocked_words (
+  id SERIAL PRIMARY KEY,
+  word VARCHAR(80) UNIQUE NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 `);
 
 const app = express();
-
 app.use(cors());
-app.use(express.json({ limit: '64kb' }));
+app.use(express.json({ limit: '1mb' }));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
@@ -70,29 +89,98 @@ const sign = user =>
     { expiresIn: '30d' }
   );
 
-function publicUser(row) {
-  return {
+function publicUser(row, includePrivate = false) {
+  const user = {
     id: row.id,
     name: row.name,
     username: row.username,
-    email: row.email,
-    role: row.role
+    role: row.role,
+    avatarUrl: row.avatar_url || null,
+    status: row.status || 'active'
   };
+
+  if (includePrivate) {
+    user.email = row.email;
+    user.phoneYape = row.phone_yape || '';
+    user.mutedUntil = row.muted_until || null;
+  }
+
+  return user;
 }
 
 function auth(req, res, next) {
   const raw = req.headers.authorization || '';
-  const token = raw.startsWith('Bearer ')
-    ? raw.slice(7)
-    : '';
+  const token = raw.startsWith('Bearer ') ? raw.slice(7) : '';
 
   try {
     req.user = jwt.verify(token, JWT_SECRET);
     next();
   } catch {
-    res.status(401).json({
-      error: 'No autorizado'
-    });
+    res.status(401).json({ error: 'No autorizado' });
+  }
+}
+
+async function requireActiveUser(userId) {
+  const q = await pool.query(
+    'SELECT * FROM users WHERE id=$1 LIMIT 1',
+    [Number(userId)]
+  );
+  if (!q.rowCount) return { ok: false, code: 404, error: 'Usuario no existe' };
+  const user = q.rows[0];
+  if (user.status === 'blocked') {
+    return { ok: false, code: 403, error: 'Cuenta bloqueada', user };
+  }
+  return { ok: true, user };
+}
+
+function moderatorOnly(req, res, next) {
+  if (!['moderator', 'admin'].includes(req.currentUser?.role)) {
+    return res.status(403).json({ error: 'Requiere permisos de moderación' });
+  }
+  next();
+}
+
+async function activeAuth(req, res, next) {
+  auth(req, res, async () => {
+    try {
+      const state = await requireActiveUser(req.user.sub);
+      if (!state.ok) return res.status(state.code).json({ error: state.error });
+      req.currentUser = state.user;
+      next();
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: 'Error del servidor' });
+    }
+  });
+}
+
+async function filterBadWords(message) {
+  const q = await pool.query('SELECT word FROM blocked_words');
+  let clean = message;
+  for (const row of q.rows) {
+    const word = String(row.word || '').trim();
+    if (!word) continue;
+    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    clean = clean.replace(new RegExp(`\\b${escaped}\\b`, 'gi'), '*'.repeat(word.length));
+  }
+  return clean;
+}
+
+function broadcast(payload) {
+  const data = JSON.stringify(payload);
+  for (const client of wss.clients) {
+    if (client.readyState === 1) client.send(data);
+  }
+}
+
+function disconnectUser(userId, reason = 'Sesión cerrada') {
+  for (const client of wss.clients) {
+    if (Number(client.userId) === Number(userId)) {
+      try {
+        client.send(JSON.stringify({ type: 'forced_logout', reason }));
+        client.close(4003, reason);
+      } catch {}
+    }
   }
 }
 
@@ -100,7 +188,7 @@ app.get('/health', (_, res) =>
   res.json({
     ok: true,
     service: 'Ludo Activo',
-    version: '0.3.3'
+    version: '0.4.0'
   })
 );
 
@@ -287,74 +375,54 @@ app.get('/api/live/current', async (_req, res) => {
   }
 });
 
+
 app.post('/api/auth/register', async (req, res) => {
   try {
-    const name =
-      String(req.body.name || '').trim();
-
-    const username =
-      String(req.body.username || '')
-        .trim()
-        .toLowerCase();
-
-    const email =
-      String(req.body.email || '')
-        .trim()
-        .toLowerCase();
-
-    const password =
-      String(req.body.password || '');
+    const name = String(req.body.name || '').trim();
+    const username = String(req.body.username || '').trim().toLowerCase();
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const password = String(req.body.password || '');
+    const phoneYape = String(req.body.phoneYape || req.body.phone_yape || '')
+      .replace(/\D/g, '');
 
     if (
       name.length < 2 ||
       !/^[a-z0-9_.-]{3,40}$/.test(username) ||
       !email.includes('@') ||
-      password.length < 6
+      password.length < 6 ||
+      !/^9\d{8}$/.test(phoneYape)
     ) {
       return res.status(400).json({
-        error: 'Datos inválidos'
+        error: 'Datos inválidos. El teléfono Yape debe tener 9 dígitos y comenzar en 9.'
       });
     }
 
-    const hash =
-      await bcrypt.hash(password, 12);
+    const hash = await bcrypt.hash(password, 12);
 
     const q = await pool.query(
-      'INSERT INTO users(name,username,email,password_hash) VALUES($1,$2,$3,$4) RETURNING *',
-      [name, username, email, hash]
+      `INSERT INTO users(name,username,email,password_hash,phone_yape)
+       VALUES($1,$2,$3,$4,$5)
+       RETURNING *`,
+      [name, username, email, hash, phoneYape]
     );
 
-    const user =
-      publicUser(q.rows[0]);
-
-    res.status(201).json({
-      token: sign(user),
-      user
-    });
+    const user = publicUser(q.rows[0], true);
+    res.status(201).json({ token: sign(user), user });
   } catch (e) {
     if (e.code === '23505') {
       return res.status(409).json({
-        error: 'Usuario o correo ya registrado'
+        error: 'Usuario, correo o teléfono Yape ya registrado'
       });
     }
-
     console.error(e);
-
-    res.status(500).json({
-      error: 'Error del servidor'
-    });
+    res.status(500).json({ error: 'Error del servidor' });
   }
 });
 
 app.post('/api/auth/login', async (req, res) => {
   try {
-    const login =
-      String(req.body.login || '')
-        .trim()
-        .toLowerCase();
-
-    const password =
-      String(req.body.password || '');
+    const login = String(req.body.login || '').trim().toLowerCase();
+    const password = String(req.body.password || '');
 
     const q = await pool.query(
       'SELECT * FROM users WHERE username=$1 OR email=$1 LIMIT 1',
@@ -363,138 +431,281 @@ app.post('/api/auth/login', async (req, res) => {
 
     if (
       !q.rowCount ||
-      !(await bcrypt.compare(
-        password,
-        q.rows[0].password_hash
-      ))
+      !(await bcrypt.compare(password, q.rows[0].password_hash))
     ) {
-      return res.status(401).json({
-        error: 'Credenciales incorrectas'
+      return res.status(401).json({ error: 'Credenciales incorrectas' });
+    }
+
+    if (q.rows[0].status === 'blocked') {
+      return res.status(403).json({
+        error: 'Tu cuenta está bloqueada',
+        reason: q.rows[0].ban_reason || null
       });
     }
 
-    const user =
-      publicUser(q.rows[0]);
-
-    res.json({
-      token: sign(user),
-      user
-    });
+    const user = publicUser(q.rows[0], true);
+    res.json({ token: sign(user), user });
   } catch (e) {
     console.error(e);
-
-    res.status(500).json({
-      error: 'Error del servidor'
-    });
+    res.status(500).json({ error: 'Error del servidor' });
   }
 });
 
-app.get('/api/auth/me', auth, async (req, res) => {
-  const q = await pool.query(
-    'SELECT * FROM users WHERE id=$1',
-    [Number(req.user.sub)]
-  );
-
-  if (!q.rowCount) {
-    return res.status(404).json({
-      error: 'Usuario no existe'
-    });
-  }
-
-  res.json({
-    user: publicUser(q.rows[0])
-  });
+app.get('/api/auth/me', activeAuth, async (req, res) => {
+  res.json({ user: publicUser(req.currentUser, true) });
 });
 
-app.get('/api/chat/history', auth, async (_req, res) => {
+app.patch('/api/profile', activeAuth, async (req, res) => {
+  try {
+    const name = String(req.body.name ?? req.currentUser.name).trim();
+    const email = String(req.body.email ?? req.currentUser.email).trim().toLowerCase();
+    const phoneYape = String(
+      req.body.phoneYape ?? req.body.phone_yape ?? req.currentUser.phone_yape ?? ''
+    ).replace(/\D/g, '');
+    const avatarUrl = String(
+      req.body.avatarUrl ?? req.body.avatar_url ?? req.currentUser.avatar_url ?? ''
+    ).trim();
+
+    if (name.length < 2 || !email.includes('@') || !/^9\d{8}$/.test(phoneYape)) {
+      return res.status(400).json({ error: 'Datos de perfil inválidos' });
+    }
+
+    // Por ahora guardamos URL de avatar. El upload binario lo conectaremos desde Android.
+    if (avatarUrl && !/^https?:\/\//i.test(avatarUrl)) {
+      return res.status(400).json({ error: 'avatarUrl inválida' });
+    }
+
+    const q = await pool.query(
+      `UPDATE users
+       SET name=$1,email=$2,phone_yape=$3,avatar_url=$4
+       WHERE id=$5
+       RETURNING *`,
+      [name, email, phoneYape, avatarUrl || null, req.currentUser.id]
+    );
+
+    res.json({ user: publicUser(q.rows[0], true) });
+  } catch (e) {
+    if (e.code === '23505') {
+      return res.status(409).json({ error: 'Correo o teléfono Yape ya registrado' });
+    }
+    console.error(e);
+    res.status(500).json({ error: 'Error del servidor' });
+  }
+});
+
+app.get('/api/chat/history', activeAuth, async (_req, res) => {
   const q = await pool.query(
-    'SELECT id,user_id,username,message,created_at FROM chat_messages ORDER BY id DESC LIMIT 100'
+    `SELECT cm.id,cm.user_id,cm.username,cm.message,cm.created_at,u.avatar_url
+     FROM chat_messages cm
+     JOIN users u ON u.id=cm.user_id
+     WHERE cm.deleted_at IS NULL
+     ORDER BY cm.id DESC LIMIT 100`
+  );
+  res.json({ messages: q.rows.reverse() });
+});
+
+// Lista de usuarios para panel de moderación.
+app.get('/api/mod/users', activeAuth, moderatorOnly, async (_req, res) => {
+  const q = await pool.query(
+    `SELECT id,name,username,role,avatar_url,status,muted_until,created_at
+     FROM users ORDER BY id DESC LIMIT 500`
+  );
+  res.json({ users: q.rows });
+});
+
+app.post('/api/mod/users/:id/mute', activeAuth, moderatorOnly, async (req, res) => {
+  const targetId = Number(req.params.id);
+  const minutes = Math.max(1, Math.min(Number(req.body.minutes || 10), 43200));
+
+  const target = await pool.query('SELECT * FROM users WHERE id=$1', [targetId]);
+  if (!target.rowCount) return res.status(404).json({ error: 'Usuario no existe' });
+  if (target.rows[0].role === 'admin' && req.currentUser.role !== 'admin') {
+    return res.status(403).json({ error: 'No puedes moderar a un administrador' });
+  }
+
+  const q = await pool.query(
+    `UPDATE users
+     SET muted_until=NOW() + ($1 * INTERVAL '1 minute')
+     WHERE id=$2 RETURNING *`,
+    [minutes, targetId]
   );
 
-  res.json({
-    messages: q.rows.reverse()
-  });
+  res.json({ ok: true, user: publicUser(q.rows[0]) });
+});
+
+app.post('/api/mod/users/:id/unmute', activeAuth, moderatorOnly, async (req, res) => {
+  const q = await pool.query(
+    'UPDATE users SET muted_until=NULL WHERE id=$1 RETURNING *',
+    [Number(req.params.id)]
+  );
+  if (!q.rowCount) return res.status(404).json({ error: 'Usuario no existe' });
+  res.json({ ok: true, user: publicUser(q.rows[0]) });
+});
+
+app.post('/api/mod/users/:id/block', activeAuth, moderatorOnly, async (req, res) => {
+  const targetId = Number(req.params.id);
+  const reason = String(req.body.reason || 'Incumplimiento de las normas').trim().slice(0, 250);
+
+  if (targetId === Number(req.currentUser.id)) {
+    return res.status(400).json({ error: 'No puedes bloquear tu propia cuenta' });
+  }
+
+  const target = await pool.query('SELECT * FROM users WHERE id=$1', [targetId]);
+  if (!target.rowCount) return res.status(404).json({ error: 'Usuario no existe' });
+  if (target.rows[0].role === 'admin' && req.currentUser.role !== 'admin') {
+    return res.status(403).json({ error: 'No puedes bloquear a un administrador' });
+  }
+
+  await pool.query(
+    `UPDATE users SET status='blocked',ban_reason=$1 WHERE id=$2`,
+    [reason, targetId]
+  );
+
+  disconnectUser(targetId, 'Cuenta bloqueada');
+  res.json({ ok: true });
+});
+
+app.post('/api/mod/users/:id/unblock', activeAuth, moderatorOnly, async (req, res) => {
+  const q = await pool.query(
+    `UPDATE users SET status='active',ban_reason=NULL WHERE id=$1 RETURNING *`,
+    [Number(req.params.id)]
+  );
+  if (!q.rowCount) return res.status(404).json({ error: 'Usuario no existe' });
+  res.json({ ok: true, user: publicUser(q.rows[0]) });
+});
+
+app.delete('/api/mod/messages/:id', activeAuth, moderatorOnly, async (req, res) => {
+  const q = await pool.query(
+    `UPDATE chat_messages
+     SET deleted_at=NOW(),deleted_by=$1
+     WHERE id=$2 AND deleted_at IS NULL
+     RETURNING id`,
+    [req.currentUser.id, Number(req.params.id)]
+  );
+
+  if (!q.rowCount) return res.status(404).json({ error: 'Mensaje no existe' });
+
+  broadcast({ type: 'message_deleted', id: Number(req.params.id) });
+  res.json({ ok: true });
+});
+
+app.get('/api/mod/blocked-words', activeAuth, moderatorOnly, async (_req, res) => {
+  const q = await pool.query('SELECT id,word FROM blocked_words ORDER BY word');
+  res.json({ words: q.rows });
+});
+
+app.post('/api/mod/blocked-words', activeAuth, moderatorOnly, async (req, res) => {
+  const word = String(req.body.word || '').trim().toLowerCase().slice(0, 80);
+  if (word.length < 2) return res.status(400).json({ error: 'Palabra inválida' });
+
+  const q = await pool.query(
+    `INSERT INTO blocked_words(word) VALUES($1)
+     ON CONFLICT(word) DO UPDATE SET word=EXCLUDED.word
+     RETURNING *`,
+    [word]
+  );
+  res.json({ word: q.rows[0] });
+});
+
+app.delete('/api/mod/blocked-words/:id', activeAuth, moderatorOnly, async (req, res) => {
+  await pool.query('DELETE FROM blocked_words WHERE id=$1', [Number(req.params.id)]);
+  res.json({ ok: true });
+});
+
+// Solo admin puede dar/quitar rol de moderador.
+app.post('/api/admin/users/:id/role', activeAuth, async (req, res) => {
+  if (req.currentUser.role !== 'admin') {
+    return res.status(403).json({ error: 'Solo administrador' });
+  }
+
+  const role = String(req.body.role || '');
+  if (!['user', 'moderator'].includes(role)) {
+    return res.status(400).json({ error: 'Rol inválido' });
+  }
+
+  const q = await pool.query(
+    'UPDATE users SET role=$1 WHERE id=$2 RETURNING *',
+    [role, Number(req.params.id)]
+  );
+  if (!q.rowCount) return res.status(404).json({ error: 'Usuario no existe' });
+  res.json({ ok: true, user: publicUser(q.rows[0]) });
 });
 
 wss.on('connection', (ws, request, user) => {
-  ws.send(
-    JSON.stringify({
-      username: 'LudoActivo',
-      message: 'Conectado al chat en vivo ✅',
-      created_at: new Date().toISOString()
-    })
-  );
+  ws.userId = Number(user.id);
+  ws.username = user.username;
+
+  ws.send(JSON.stringify({
+    type: 'system',
+    username: 'LudoActivo',
+    message: 'Conectado al chat en vivo ✅',
+    created_at: new Date().toISOString()
+  }));
 
   ws.on('message', async data => {
     try {
-      const body =
-        JSON.parse(data.toString());
+      const state = await requireActiveUser(ws.userId);
+      if (!state.ok) {
+        ws.send(JSON.stringify({ type: 'forced_logout', reason: state.error }));
+        return ws.close(4003, state.error);
+      }
 
-      const message =
-        String(body.message || '')
-          .trim()
-          .slice(0, 500);
+      const dbUser = state.user;
 
+      if (dbUser.muted_until && new Date(dbUser.muted_until) > new Date()) {
+        return ws.send(JSON.stringify({
+          type: 'muted',
+          message: 'Estás silenciado temporalmente.',
+          mutedUntil: dbUser.muted_until
+        }));
+      }
+
+      const body = JSON.parse(data.toString());
+      let message = String(body.message || '').trim().slice(0, 500);
       if (!message) return;
 
+      message = await filterBadWords(message);
+
       const q = await pool.query(
-        'INSERT INTO chat_messages(user_id,username,message) VALUES($1,$2,$3) RETURNING id,user_id,username,message,created_at',
-        [
-          Number(user.sub),
-          user.username,
-          message
-        ]
+        `INSERT INTO chat_messages(user_id,username,message)
+         VALUES($1,$2,$3)
+         RETURNING id,user_id,username,message,created_at`,
+        [dbUser.id, dbUser.username, message]
       );
 
-      const payload =
-        JSON.stringify(q.rows[0]);
+      const payload = {
+        type: 'message',
+        ...q.rows[0],
+        avatar_url: dbUser.avatar_url || null
+      };
 
-      for (const client of wss.clients) {
-        if (client.readyState === 1) {
-          client.send(payload);
-        }
-      }
+      broadcast(payload);
     } catch (e) {
-      console.error(
-        'chat error',
-        e
-      );
+      console.error('chat error', e);
     }
   });
 });
 
-server.on('upgrade', (request, socket, head) => {
+server.on('upgrade', async (request, socket, head) => {
   try {
-    const url =
-      new URL(
-        request.url,
-        `http://${request.headers.host}`
-      );
+    const url = new URL(request.url, `http://${request.headers.host}`);
 
-    if (url.pathname !== '/ws/chat') {
-      return socket.destroy();
-    }
+    if (url.pathname !== '/ws/chat') return socket.destroy();
 
-    const token =
-      url.searchParams.get('token');
+    const token = url.searchParams.get('token');
+    const decoded = jwt.verify(token, JWT_SECRET);
 
-    const user =
-      jwt.verify(
-        token,
-        JWT_SECRET
-      );
+    const state = await requireActiveUser(decoded.sub);
+    if (!state.ok) return socket.destroy();
 
-    wss.handleUpgrade(
-      request,
-      socket,
-      head,
-      ws =>
-        wss.emit(
-          'connection',
-          ws,
-          request,
-          user
-        )
+    const user = {
+      id: state.user.id,
+      username: state.user.username,
+      role: state.user.role
+    };
+
+    wss.handleUpgrade(request, socket, head, ws =>
+      wss.emit('connection', ws, request, user)
     );
   } catch {
     socket.destroy();
@@ -504,8 +715,5 @@ server.on('upgrade', (request, socket, head) => {
 server.listen(
   PORT,
   '0.0.0.0',
-  () =>
-    console.log(
-      `Ludo Activo backend en puerto ${PORT}`
-    )
+  () => console.log(`Ludo Activo backend en puerto ${PORT}`)
 );
