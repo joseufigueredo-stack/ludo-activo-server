@@ -130,11 +130,7 @@ app.get('/health', (_, res) =>
 */
 app.get('/api/live/current', async (_req, res) => {
   try {
-    if (
-      !CLOUDFLARE_ACCOUNT_ID ||
-      !CLOUDFLARE_API_TOKEN ||
-      !CLOUDFLARE_LIVE_INPUT_ID
-    ) {
+    if (!CLOUDFLARE_API_TOKEN || !CLOUDFLARE_LIVE_INPUT_ID) {
       return res.status(500).json({
         live: false,
         videoUID: null,
@@ -143,12 +139,13 @@ app.get('/api/live/current', async (_req, res) => {
       });
     }
 
-    const url =
-      `https://api.cloudflare.com/client/v4/accounts/` +
-      `${CLOUDFLARE_ACCOUNT_ID}/stream/live_inputs/` +
-      `${CLOUDFLARE_LIVE_INPUT_ID}/videos`;
+    const customerHost =
+      'customer-wjqmkt5ikziq5i6i.cloudflarestream.com';
 
-    const cfResponse = await fetch(url, {
+    const lifecycleUrl =
+      `https://${customerHost}/${CLOUDFLARE_LIVE_INPUT_ID}/lifecycle`;
+
+    const cfResponse = await fetch(lifecycleUrl, {
       method: 'GET',
       headers: {
         Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
@@ -158,34 +155,22 @@ app.get('/api/live/current', async (_req, res) => {
 
     const data = await cfResponse.json();
 
-    if (!cfResponse.ok || data.success === false) {
-      console.error(
-        'Cloudflare API error:',
-        JSON.stringify(data)
-      );
+    if (!cfResponse.ok) {
+      console.error('Cloudflare lifecycle error:', JSON.stringify(data));
 
       return res.status(502).json({
         live: false,
         videoUID: null,
         hls: null,
-        error: 'Cloudflare no respondió correctamente'
+        error: 'Cloudflare lifecycle no respondió correctamente',
+        status: cfResponse.status
       });
     }
 
-    const videos = Array.isArray(data.result)
-      ? data.result
-      : [];
+    const live = data.live === true;
+    const videoUID = data.videoUID || null;
 
-    const activeVideo = videos.find(video => {
-      const state =
-        video?.status?.state ||
-        video?.status ||
-        '';
-
-      return state === 'live-inprogress';
-    });
-
-    if (!activeVideo) {
+    if (!live || !videoUID) {
       return res.json({
         live: false,
         videoUID: null,
@@ -193,25 +178,8 @@ app.get('/api/live/current', async (_req, res) => {
       });
     }
 
-    const videoUID =
-      activeVideo.uid || null;
-
     const hls =
-      activeVideo?.playback?.hls || null;
-
-    if (!videoUID || !hls) {
-      console.error(
-        'Broadcast activo sin UID/HLS:',
-        JSON.stringify(activeVideo)
-      );
-
-      return res.status(502).json({
-        live: false,
-        videoUID: null,
-        hls: null,
-        error: 'Cloudflare no entregó el HLS del live'
-      });
-    }
+      `https://${customerHost}/${videoUID}/manifest/video.m3u8`;
 
     return res.json({
       live: true,
@@ -219,10 +187,7 @@ app.get('/api/live/current', async (_req, res) => {
       hls
     });
   } catch (e) {
-    console.error(
-      'Error consultando live actual:',
-      e
-    );
+    console.error('Error consultando lifecycle:', e);
 
     return res.status(500).json({
       live: false,
