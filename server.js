@@ -193,7 +193,7 @@ app.get('/health', (_, res) =>
   res.json({
     ok: true,
     service: 'Ludo Activo',
-    version: '0.5.4'
+    version: '0.5.5'
   })
 );
 
@@ -778,8 +778,8 @@ wss.on('connection', (ws, request, user) => {
 
   ws.send(JSON.stringify({
     type: 'system',
-    username: 'LudoActivo',
-    message: 'Conectado al chat en vivo ✅',
+    username: 'Ludo Activo',
+    message: `¡Bienvenido ${user.name || user.username}! 🎉 Disfruta el en vivo y comparte con la comunidad.`,
     created_at: new Date().toISOString()
   }));
 
