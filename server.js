@@ -7,6 +7,7 @@ import pg from 'pg';
 import { WebSocketServer } from 'ws';
 import http from 'http';
 import { URL } from 'url';
+import { randomUUID, randomBytes } from 'crypto';
 
 const { Pool } = pg;
 
@@ -76,6 +77,7 @@ CREATE TABLE IF NOT EXISTS blocked_words (
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '8mb' }));
+app.use(express.static('public'));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
@@ -380,6 +382,59 @@ app.get('/api/live/current', async (_req, res) => {
   }
 });
 
+
+// Acceso público al chat sin contraseña. Cada visita obtiene una cuenta invitada
+// de permisos limitados. Los nombres de administradores y moderadores se reservan.
+const guestAttempts = new Map();
+app.post('/api/auth/guest', async (req, res) => {
+  try {
+    const name = String(req.body?.name || '').trim().replace(/\s+/g, ' ');
+    if (name.length < 2 || name.length > 40 || !/^[\p{L}\p{N} _.-]+$/u.test(name)) {
+      return res.status(400).json({ error: 'Nombre inválido (2 a 40 caracteres).' });
+    }
+    const ip = String(req.ip || req.socket.remoteAddress || 'unknown');
+    const now = Date.now();
+    const last = guestAttempts.get(ip) || 0;
+    if (now - last < 5000) {
+      return res.status(429).json({ error: 'Espera unos segundos antes de volver a entrar.' });
+    }
+    guestAttempts.set(ip, now);
+    if (guestAttempts.size > 5000) {
+      for (const [key, value] of guestAttempts) {
+        if (now - value > 60000) guestAttempts.delete(key);
+      }
+    }
+
+    const protectedName = await pool.query(
+      `SELECT 1 FROM users WHERE role IN ('admin','moderator')
+       AND (LOWER(name)=LOWER($1) OR LOWER(username)=LOWER($1)) LIMIT 1`,
+      [name]
+    );
+    if (protectedName.rowCount || /^(admin|administrador|moderador|ludo activo|soporte|sistema)$/i.test(name)) {
+      return res.status(400).json({ error: 'Ese nombre está reservado.' });
+    }
+
+    const uid = randomUUID().replace(/-/g, '');
+    const username = `guest_${uid.slice(0, 24)}`;
+    const email = `${uid}@guest.invalid`;
+    const hash = await bcrypt.hash(randomBytes(24).toString('hex'), 10);
+    const q = await pool.query(
+      `INSERT INTO users(name,username,email,password_hash,role)
+       VALUES($1,$2,$3,$4,'user') RETURNING *`,
+      [name, username, email, hash]
+    );
+    const user = q.rows[0];
+    const token = jwt.sign(
+      { sub: user.id, username: user.username, role: 'user', guest: true },
+      JWT_SECRET,
+      { expiresIn: '12h' }
+    );
+    return res.status(201).json({ token, user: publicUser(user) });
+  } catch (e) {
+    console.error('guest auth error', e);
+    return res.status(500).json({ error: 'No se pudo entrar al chat.' });
+  }
+});
 
 app.post('/api/auth/register', async (req, res) => {
   try {
@@ -811,7 +866,7 @@ wss.on('connection', (ws, request, user) => {
         `INSERT INTO chat_messages(user_id,username,message)
          VALUES($1,$2,$3)
          RETURNING id,user_id,username,message,created_at`,
-        [dbUser.id, dbUser.username, message]
+        [dbUser.id, dbUser.username.startsWith('guest_') ? dbUser.name : dbUser.username, message]
       );
 
       const payload = {
